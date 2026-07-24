@@ -499,9 +499,15 @@ class RingGroup : public GroupImpl {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_input_array(input);
     encoder.set_output_array(output);
+    // Retain both buffers for the lifetime of the queued task: `dispatch` only
+    // enqueues, `set_input_array`/`set_output_array` are no-ops on the CPU
+    // backend, and `cpu::eval`'s keep-alive excludes the freshly-allocated
+    // output. See mlx/distributed/jaccl/jaccl.cpp for the full rationale.
     encoder.dispatch([input_ptr = input.data<char>(),
                       nbytes = input.nbytes(),
                       output_ptr = output.data<char>(),
+                      in_buf = input.data_shared_ptr(),
+                      out_buf = output.data_shared_ptr(),
                       this]() {
       constexpr size_t min_send_size = 262144;
       size_t n_gathers = std::max(
@@ -536,7 +542,11 @@ class RingGroup : public GroupImpl {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_input_array(input);
     encoder.dispatch(
-        [input_ptr = input.data<char>(), nbytes = input.nbytes(), dst, this]() {
+        [input_ptr = input.data<char>(),
+         nbytes = input.nbytes(),
+         dst,
+         in_buf = input.data_shared_ptr(),
+         this]() {
           int right = (rank_ + 1) % size_;
           int left = (rank_ + size_ - 1) % size_;
           if (dst == right) {
@@ -557,7 +567,11 @@ class RingGroup : public GroupImpl {
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_output_array(out);
     encoder.dispatch(
-        [out_ptr = out.data<char>(), nbytes = out.nbytes(), src, this]() {
+        [out_ptr = out.data<char>(),
+         nbytes = out.nbytes(),
+         src,
+         out_buf = out.data_shared_ptr(),
+         this]() {
           // NOTE: We 'll check the sockets with the opposite order of send so
           // that they work even with 2 nodes where left and right is the same
           // neighbor.
@@ -592,7 +606,13 @@ class RingGroup : public GroupImpl {
     auto out_ptr = output.data<char>();
     auto& encoder = cpu::get_command_encoder(stream);
     encoder.set_output_array(output);
-    encoder.dispatch([in_ptr, out_ptr, size = input.size(), this, reduce_op]() {
+    encoder.dispatch([in_ptr,
+                      out_ptr,
+                      size = input.size(),
+                      in_buf = input.data_shared_ptr(),
+                      out_buf = output.data_shared_ptr(),
+                      this,
+                      reduce_op]() {
       // If the input data cannot be split into size_ segments then copy it and
       // all reduce a local buffer prefilled with 0s.
       size_t nbytes = size * sizeof(T);

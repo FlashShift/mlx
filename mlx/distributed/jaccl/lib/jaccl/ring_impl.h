@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <iostream>
 #include <span>
 
 #include "jaccl/rdma.h"
@@ -130,13 +131,28 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
+          in_flight--;
+
+          // Guard against corrupt/failed completions. A non-SUCCESS or
+          // spurious completion (which the Thunderbolt-RDMA provider can emit
+          // under load) has an undefined wr_id; the decoded wire/lr/lw/buff
+          // would then index send_count/recv_count/{send,recv}_offset/limits
+          // and the buffer pools OUT OF BOUNDS -> a wild pointer in
+          // reduce_op/std::copy -> SIGSEGV. The in-flight slot is already
+          // retired above, so drop the bad completion and keep draining.
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
           int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
-
-          in_flight--;
+          if (wc[i].status != IBV_WC_SUCCESS || lr >= MAX_DIR ||
+              lw >= n_wires || buff >= PIPELINE) {
+            std::cerr << "[jaccl] rank " << rank_
+                      << ": dropped bad all_reduce completion (status="
+                      << wc[i].status << ", wr_id=0x" << std::hex << wc[i].wr_id
+                      << std::dec << ")" << std::endl;
+            continue;
+          }
 
           if (work_type == SEND_WR && send_count[wire] < n_steps) {
             int64_t offset = lw * N + send_count[wire] * n_wires * N +
@@ -229,13 +245,28 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
+          in_flight--;
+
+          // Guard against corrupt/failed completions. A non-SUCCESS or
+          // spurious completion (which the Thunderbolt-RDMA provider can emit
+          // under load) has an undefined wr_id; the decoded wire/lr/lw/buff
+          // would then index send_count/recv_count/{send,recv}_offset/limits
+          // and the buffer pools OUT OF BOUNDS -> a wild pointer in
+          // reduce_op/std::copy -> SIGSEGV. The in-flight slot is already
+          // retired above, so drop the bad completion and keep draining.
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
           int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
-
-          in_flight--;
+          if (wc[i].status != IBV_WC_SUCCESS || lr >= MAX_DIR ||
+              lw >= n_wires || buff >= PIPELINE) {
+            std::cerr << "[jaccl] rank " << rank_
+                      << ": dropped bad all_reduce completion (status="
+                      << wc[i].status << ", wr_id=0x" << std::hex << wc[i].wr_id
+                      << std::dec << ")" << std::endl;
+            continue;
+          }
 
           if (work_type == SEND_WR && send_count[wire] < n_steps) {
             int64_t offset = lw * N + send_count[wire] * n_wires * N +
@@ -306,7 +337,10 @@ class RingImpl {
     size_t n_bytes_per_wire = (n_bytes + (2 * n_wires) - 1) / (2 * n_wires);
     size_t out_bytes = n_bytes * size_;
     auto [sz, N] = buffer_size_from_message(n_bytes_per_wire);
-    int n_steps = (n_bytes_per_wire + N - 1) / N;
+    // 64-bit to match all_reduce above: the step count and the offsets derived
+    // from it (send_count * n_wires * N) exceed 2^31 once a single collective's
+    // per-rank payload reaches ~4GB, which would wrap an `int`.
+    int64_t n_steps = (n_bytes_per_wire + N - 1) / N;
 
     // Counters to maintain the state of transfers
     int in_flight = 0;
@@ -354,13 +388,25 @@ class RingImpl {
         ibv_wc wc[WC_NUM];
         int n = poll(left_, right_, WC_NUM, wc);
         for (int i = 0; i < n; i++) {
+          in_flight--;
+
+          // Same guard as all_reduce: a corrupt/failed completion's wr_id must
+          // never index send_count/{send,recv}_offset/limits or the buffer
+          // pools (out of bounds -> wild pointer -> SIGSEGV). all_gather is
+          // always 2-directional.
           int work_type = wc[i].wr_id >> 16;
           int buff = (wc[i].wr_id >> 8) & 0xff;
           int wire = wc[i].wr_id & 0xff;
           int lr = wire / RING_MAX_CONNS;
           int lw = wire % RING_MAX_CONNS;
-
-          in_flight--;
+          if (wc[i].status != IBV_WC_SUCCESS || lr >= 2 || lw >= n_wires ||
+              buff >= PIPELINE) {
+            std::cerr << "[jaccl] rank " << rank_
+                      << ": dropped bad all_gather completion (status="
+                      << wc[i].status << ", wr_id=0x" << std::hex << wc[i].wr_id
+                      << std::dec << ")" << std::endl;
+            continue;
+          }
 
           if (work_type == SEND_WR && send_count[wire] < n_steps) {
             int64_t offset = lw * N + send_count[wire] * n_wires * N +
@@ -450,11 +496,21 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(conns, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        in_flight--;
+
+        // Guard against corrupt/failed completions (see all_reduce): a bad
+        // wr_id must not index read_offset/limits or the buffer pool.
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int wire = wc[i].wr_id & 0xff;
         int lw = wire % RING_MAX_CONNS;
-
-        in_flight--;
+        if (wc[i].status != IBV_WC_SUCCESS || lw >= n_wires ||
+            buff >= PIPELINE) {
+          std::cerr << "[jaccl] rank " << rank_
+                    << ": dropped bad send completion (status=" << wc[i].status
+                    << ", wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                    << ")" << std::endl;
+          continue;
+        }
 
         if (read_offset[lw] < limits[lw]) {
           std::copy(
@@ -513,11 +569,21 @@ class RingImpl {
       ibv_wc wc[WC_NUM];
       int n = poll(conns, WC_NUM, wc);
       for (int i = 0; i < n; i++) {
+        in_flight--;
+
+        // Guard against corrupt/failed completions (see all_reduce): a bad
+        // wr_id must not index write_offset/limits or the buffer pool.
         int buff = (wc[i].wr_id >> 8) & 0xff;
         int wire = wc[i].wr_id & 0xff;
         int lw = wire % RING_MAX_CONNS;
-
-        in_flight--;
+        if (wc[i].status != IBV_WC_SUCCESS || lw >= n_wires ||
+            buff >= PIPELINE) {
+          std::cerr << "[jaccl] rank " << rank_
+                    << ": dropped bad recv completion (status=" << wc[i].status
+                    << ", wr_id=0x" << std::hex << wc[i].wr_id << std::dec
+                    << ")" << std::endl;
+          continue;
+        }
 
         std::copy(
             recv_buffer(sz, buff, dir, lw).begin<char>(),
